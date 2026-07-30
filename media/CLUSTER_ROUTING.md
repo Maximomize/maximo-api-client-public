@@ -280,20 +280,22 @@ cookie is bound to JVM A's `HttpSession` and won't authenticate on JVM B.
 
 ### Install
 
-Deploy as a REST-handler autoscript named `MAXIMOMIZE.CLUSTER`, language
-`jython`, status `Active`, with source from
-`resources/autoscripts/MAXIMOMIZE.CLUSTER.py`.
+You can install the autoscript programmatically via the client library:
 
-For development, an idempotent installer is included:
+```ts
+// Idempotently installs or updates the bundled MAXIMOMIZE.CLUSTER autoscript
+const result = await client.cluster.installScript({ verify: true });
+console.log(result); // { ok: true, created: true, updated: false, verified: true, scriptName: 'MAXIMOMIZE.CLUSTER' }
+```
+
+Alternatively, run the included CLI installer script:
 
 ```bash
 # .env.proxy / .env.cluster / .env at repo root with maximo_host + apikey
 npx ts-node scripts/install-cluster-script.ts
 ```
 
-It creates the script if missing, or replaces the source in place
-(resolving the numeric `autoscriptid` by name via OSLC, since Maximo's
-update path requires the id rather than the script name).
+Both methods idempotently deploy the script source bundled in `resources/autoscripts/MAXIMOMIZE.CLUSTER.py` using OSLC bulk `AddChange` requests.
 
 ### Jython constraints honoured
 
@@ -308,13 +310,69 @@ update path requires the id rather than the script name).
 
 The ping payload exposes two version fields:
 
-- `SCRIPT_VERSION` (`"1.0.0"`) — bumped on behaviour changes.
+- `SCRIPT_VERSION` (currently `"1.1.0"`) — bumped on behaviour changes.
 - `SCRIPT_PROTOCOL` (`1`) — bumped only on backward-incompatible wire-shape
   changes to relay/whereis payloads.
+
+Version history:
+- **1.0.0** — initial: `nodes` / `whereis` / `relay` (buffered) / `ping`.
+- **1.1.0** — relay learned SSE / NDJSON pass-through (no body buffering for
+  streaming content types); inbound PATCH is translated to POST +
+  `x-method-override: PATCH` so it survives Java's `HttpURLConnection.setRequestMethod`
+  (which rejects PATCH).
 
 Clients compare against the value they were built for and can warn an
 operator to redeploy when the script is too old. The client itself also
 falls back gracefully if `?action=ping` is missing entirely.
+
+### Streaming responses through the relay (SSE / NDJSON)
+
+The relay detects streaming `Content-Type`s and switches from
+"buffer everything via `_drain`" to "pipe upstream bytes straight to the
+servlet output stream." The detection covers:
+
+- `text/event-stream` (SSE)
+- `application/x-ndjson`
+- `application/stream+json`
+
+For these, the relay writes directly to `request.getHttpServletResponse().getOutputStream()`
+without setting the `responseBody` global — letting Maximo's scripthandler
+finalize the response without overwriting the streamed bytes. The same
+`X-Maximomize-Node` / `X-Maximomize-Relay-Target` / `X-Maximomize-Relay-Endpoint`
+diagnostic headers are stamped before `flushBuffer()` so they reach the
+client (headers must be set before the response is committed).
+
+This means a pinned client can call any SSE-producing autoscript and the
+stream comes back transparently. For example, with a Maximomize log-tail
+script (`MAXIMOMIZE.LOGSTREAM`) installed:
+
+```ts
+const target = await client.cluster.findUserJvm('alice');
+const pinned = await client.pinTo(target!);
+
+// pinned client → cluster relay → target pod → MAXIMOMIZE.LOGSTREAM → SSE stream back
+const resp = await (pinned as any).getHttpClient().axiosInstance.get(
+    '/maximo/api/script/MAXIMOMIZE.LOGSTREAM',
+    { params: { action: 'stream', timeout: '30' }, responseType: 'stream' }
+);
+// resp.data is a Node Readable; parse SSE frames as they arrive.
+```
+
+Two approaches to log streaming worth comparing:
+
+1. **Via the cluster relay** (this code path). One install of `MAXIMOMIZE.CLUSTER`
+   makes every SSE-producing script automatically pinnable. The relay
+   adds a small fixed overhead per stream (intra-pod HTTP hop) but no
+   per-frame cost — the bytes are forwarded as they arrive.
+2. **Direct stream** (no relay). A client that targets the SSE script
+   directly without going through the relay. Lower latency, no extra hop,
+   but the client either accepts whichever JVM the LB picks or needs
+   another mechanism (per-pod ingress, JSESSIONID clone affinity) to
+   land on the chosen JVM.
+
+Both have their place. The relay is the right answer when you want
+"pin once, then call anything"; the direct stream wins when you only do
+log tailing and want minimum latency.
 
 ### Notes about ports — RMI vs HTTP
 
